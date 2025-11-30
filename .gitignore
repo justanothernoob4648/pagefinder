@@ -1,0 +1,14 @@
+# Byte-compiled / cache files
+__pycache__/
+*.py[cod]
+*$py.class
+
+# Virtual environments
+.venv/
+.venv-py39/
+
+# OS junk
+.DS_Store
+
+# Output artifacts
+*.csv
