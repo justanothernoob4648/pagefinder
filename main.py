@@ -1,65 +1,50 @@
 from __future__ import annotations
 
-import argparse
-from typing import List
-
-import numpy as np
-
 from crawler import crawl_website
-from graph_builder import (
-    build_adjacency_matrix,
-    build_node_index,
-    normalize_adjacency_matrix,
-)
+from markov import build_markov_matrix, compute_pagerank, rank_pages
 
 
-def parse_args() -> argparse.Namespace:
-    parser = argparse.ArgumentParser(description="Crawl a site and build PageRank inputs.")
-    parser.add_argument("--url", required=True, help="Root URL to crawl (e.g., https://example.com)")
-    parser.add_argument(
-        "--max-pages",
-        type=int,
-        default=200,
-        help="Maximum number of pages to visit (default: 200)",
-    )
-    return parser.parse_args()
+# ----------------------- Main driver ----------------------- #
+def main(entry_url: str, goals: Optional[List[str]] = None) -> None:
+    graph, url_to_index, index_to_url = crawl_website(entry_url)
+    titles = getattr(crawl_website, "titles", {})
+    snippets = getattr(crawl_website, "snippets", {})
 
+    markov = build_markov_matrix(graph, url_to_index)
+    pagerank = compute_pagerank(markov)
 
-def save_nodes(node_order: List[str]) -> None:
-    with open("nodes.csv", "w", encoding="utf-8") as f:
-        f.write("index,url\n")
-        for idx, url in enumerate(node_order):
-            f.write(f"{idx},{url}\n")
+    print(f"Crawled {len(url_to_index)} pages. Ready for ranking queries.")
 
+    def _rank_and_print(goal: str) -> None:
+        ranked = rank_pages(goal, titles, snippets, pagerank, url_to_index)
+        print(f"\nGoal: {goal}")
+        print("Top 10 pages:")
+        for url, score in ranked[:10]:
+            title = titles.get(url, "")
+            snippet = snippets.get(url, "")
+            print(f"- {url} | score={score:.4f} | title={title} | snippet='{snippet[:100]}'")
 
-def main() -> None:
-    args = parse_args()
-
-    links = crawl_website(args.url, max_pages=args.max_pages)
-    node_index = build_node_index(links)
-    adjacency_matrix = build_adjacency_matrix(links, node_index)
-    normalized_matrix = normalize_adjacency_matrix(adjacency_matrix)
-
-    ordered_nodes = [url for url, _ in sorted(node_index.items(), key=lambda kv: kv[1])]
-    np.savetxt("adjacency_matrix.csv", adjacency_matrix, fmt="%d", delimiter=",")
-    np.savetxt(
-        "adjacency_matrix_normalized.csv",
-        normalized_matrix,
-        fmt="%.6f",
-        delimiter=",",
-    )
-    save_nodes(ordered_nodes)
-
-    edge_count = int(adjacency_matrix.sum())
-    sample_nodes = ordered_nodes[:5]
-
-    print(f"Crawled {len(ordered_nodes)} pages (limit {args.max_pages}).")
-    print(f"Edges: {edge_count}")
-    if sample_nodes:
-        print("Sample nodes:")
-        for node in sample_nodes:
-            print(f" - {node}")
+    if goals:
+        for goal in goals:
+            _rank_and_print(goal)
+    else:
+        try:
+            while True:
+                goal = input("\nEnter goal (or blank to quit): ").strip()
+                if not goal:
+                    break
+                _rank_and_print(goal)
+        except (EOFError, KeyboardInterrupt):
+            return
 
 
 if __name__ == "__main__":
-    main()
+    import sys
+
+    if len(sys.argv) < 2:
+        print("Usage: python main.py <entry_url> [goal1 goal2 ...]")
+        sys.exit(1)
+
+    entry = sys.argv[1]
+    goals = sys.argv[2:]
+    main(entry, goals if goals else None)

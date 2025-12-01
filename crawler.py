@@ -1,27 +1,22 @@
 from __future__ import annotations
 
-from collections import deque
-from typing import Dict, Optional, Set
+import asyncio
+from collections import defaultdict, deque
+from typing import Dict, List, Optional, Set, Tuple
 from urllib.parse import urljoin, urlparse, urlunparse
 
-import requests
+import aiohttp
 from bs4 import BeautifulSoup
 
-USER_AGENT = "PagerankCrawler/1.0"
-DEFAULT_HEADERS = {"User-Agent": USER_AGENT}
+USER_AGENT = "PageRankPlus/1.0"
+REQUEST_TIMEOUT = aiohttp.ClientTimeout(total=15)
 
 
-def canonicalize_url(url: str) -> Optional[str]:
-    """
-    Normalize a URL for consistent graph nodes.
-
-    - Resolves scheme/netloc casing.
-    - Removes fragments and query strings.
-    - Strips trailing slashes except for the root path.
-    Returns None for non-http(s) URLs or missing hosts.
-    """
+# ----------------------- URL helpers ----------------------- #
+def clean_url(url: str) -> Optional[str]:
+    """Normalize a URL by removing fragments/query, normalizing scheme/host, and trimming slashes."""
     parsed = urlparse(url)
-    if parsed.scheme not in ("http", "https"):
+    if parsed.scheme and parsed.scheme.lower() not in {"http", "https"}:
         return None
 
     netloc = parsed.netloc.lower()
@@ -29,96 +24,161 @@ def canonicalize_url(url: str) -> Optional[str]:
         return None
 
     path = parsed.path or "/"
-    path = path.rstrip("/")
-    if path == "":
-        path = "/"
+    path = path.rstrip("/") or "/"
 
     cleaned = parsed._replace(
-        scheme=parsed.scheme.lower(),
+        scheme=(parsed.scheme or "http").lower(),
         netloc=netloc,
         path=path,
         params="",
-        query="",  # drop queries to reduce duplicate variants
+        query="",
         fragment="",
     )
     return urlunparse(cleaned)
 
 
-def crawl_website(root_url: str, max_pages: int = 200) -> Dict[str, Set[str]]:
-    """
-    Crawl a single domain starting at root_url and collect link graph edges.
+def is_internal_link(url: str, root_netloc: str) -> bool:
+    """Check if a link belongs to the same domain (ignoring leading www)."""
+    parsed = urlparse(url)
+    host = parsed.netloc.lower()
+    base = root_netloc.lower()
+    if host == base:
+        return True
+    if host.startswith("www."):
+        host = host[4:]
+    if base.startswith("www."):
+        base = base[4:]
+    return host == base
 
-    Returns a mapping of canonical URL -> set of canonical URLs it links to.
-    Pages outside the starting domain are ignored.
-    """
-    canonical_root = canonicalize_url(root_url)
-    if not canonical_root:
-        raise ValueError(f"Invalid root URL: {root_url}")
 
-    allowed_domain = urlparse(canonical_root).netloc
-
-    def strip_www(host: str) -> str:
-        return host[4:] if host.startswith("www.") else host
-
-    base_domain = strip_www(allowed_domain)
-
-    def in_domain(netloc: str) -> bool:
-        host = netloc.lower()
-        return host == allowed_domain or strip_www(host) == base_domain
-
-    to_visit = deque([canonical_root])
-    visited: Set[str] = set()
-    links: Dict[str, Set[str]] = {}
-
-    while to_visit and len(visited) < max_pages:
-        current = to_visit.popleft()
-        if current in visited:
+# ----------------------- Extraction helpers ----------------------- #
+def extract_links(soup: BeautifulSoup, base_url: str, root_netloc: str) -> Set[str]:
+    """Extract and normalize same-domain anchor links from a page."""
+    links: Set[str] = set()
+    for anchor in soup.find_all("a", href=True):
+        href = anchor.get("href")
+        resolved = urljoin(base_url, href)
+        cleaned = clean_url(resolved)
+        if not cleaned:
             continue
-
-        try:
-            response = requests.get(
-                current, headers=DEFAULT_HEADERS, timeout=10, allow_redirects=True
-            )
-        except requests.RequestException:
+        if not is_internal_link(cleaned, root_netloc):  # check that the link is within the same domain
             continue
-
-        canonical_current = canonicalize_url(response.url)
-        if not canonical_current or not in_domain(urlparse(canonical_current).netloc):
-            continue
-        if canonical_current in visited:
-            continue
-
-        visited.add(canonical_current)
-
-        if response.status_code >= 400:
-            continue
-
-        content_type = response.headers.get("Content-Type", "")
-        if "text/html" not in content_type:
-            continue
-
-        links.setdefault(canonical_current, set())
-
-        soup = BeautifulSoup(response.text, "html.parser")
-        for anchor in soup.find_all("a", href=True):
-            raw_href = anchor.get("href")
-            if not raw_href:
-                continue
-
-            resolved = urljoin(canonical_current, raw_href)
-            normalized = canonicalize_url(resolved)
-            if not normalized:
-                continue
-            if not in_domain(urlparse(normalized).netloc):
-                continue
-
-            links[canonical_current].add(normalized)
-
-            if (
-                normalized not in visited
-                and normalized not in to_visit
-                and len(visited) + len(to_visit) < max_pages
-            ):
-                to_visit.append(normalized)
-
+        links.add(cleaned)
     return links
+
+
+def extract_navigation_links(
+    soup: BeautifulSoup, base_url: str, root_netloc: str
+) -> Set[str]:
+    """Collect links inside nav/header/menu/ul elements as crawl seeds."""
+    nav_links: Set[str] = set()
+    for tag_name in ("nav", "header", "menu", "ul"):
+        for tag in soup.find_all(tag_name):
+            nav_links.update(extract_links(tag, base_url, root_netloc))
+    return nav_links
+
+
+
+
+# ----------------------- Crawling ----------------------- #
+async def fetch_html(session: aiohttp.ClientSession, url: str) -> Optional[str]:
+    """Fetch a page and return text content (no content-type filtering)."""
+    try:
+        async with session.get(url) as resp:
+            if resp.status >= 400:
+                return None
+            try:
+                return await resp.text()
+            except UnicodeDecodeError:
+                raw = await resp.read()
+                return raw.decode(errors="ignore")
+    except (aiohttp.ClientError, asyncio.TimeoutError, asyncio.CancelledError):
+        return None
+
+
+def _extract_title(soup: BeautifulSoup) -> str:
+    return soup.title.string.strip() if soup.title and soup.title.string else ""
+
+
+async def _crawl_async(
+    entry_url: str, max_depth: int
+) -> Tuple[Dict[str, List[str]], Dict[str, str], Dict[str, str]]:
+    graph: Dict[str, List[str]] = defaultdict(list)
+    titles: Dict[str, str] = {}
+    snippets: Dict[str, str] = {}
+    seen: Set[str] = set()
+
+    entry_clean = clean_url(entry_url)
+    if not entry_clean:
+        raise ValueError(f"Invalid entry URL: {entry_url}")
+    root_netloc = urlparse(entry_clean).netloc
+
+    async with aiohttp.ClientSession(
+        timeout=REQUEST_TIMEOUT, headers={"User-Agent": USER_AGENT}
+    ) as session:
+        home_html = await fetch_html(session, entry_clean)
+        if not home_html:
+            return graph, titles, snippets
+
+        home_soup = BeautifulSoup(home_html, "html.parser")
+        titles[entry_clean] = _extract_title(home_soup)
+        home_text = home_soup.get_text(" ", strip=True)
+        snippets[entry_clean] = home_text[:300]
+
+        nav_links = extract_navigation_links(home_soup, entry_clean, root_netloc)
+        graph[entry_clean] = sorted(nav_links)
+        seen.add(entry_clean)
+        print(f"[crawl] seed={entry_clean} nav_links={len(nav_links)}", flush=True) #for tracing purposes
+
+        queue = deque((link, 1) for link in nav_links)
+        for link in nav_links:
+            print(f"[crawl] nav-link -> {link}", flush=True)
+
+        while queue:
+            link, depth = queue.popleft()
+            if depth > max_depth or link in seen:
+                continue
+
+            print(f"[crawl] depth={depth} url={link}", flush=True)
+            seen.add(link)
+
+            html = await fetch_html(session, link)
+            if not html:
+                graph.setdefault(link, [])
+                continue
+
+            soup = BeautifulSoup(html, "html.parser")
+            titles[link] = _extract_title(soup)
+            text = soup.get_text(" ", strip=True)
+            snippets[link] = text[:300]
+
+            links = extract_links(soup, link, root_netloc)
+            graph[link] = sorted(links)
+
+            if depth < max_depth:
+                for child in list(links)[:15]:  # limit breadth to 15 children
+                    if child not in seen:
+                        queue.append((child, depth + 1))
+
+    return graph, titles, snippets
+
+
+def crawl_website(entry_url: str, max_depth: int = 2):
+    """
+    Crawl from a site's navigation links and build a link graph.
+
+    Returns (graph, url_to_index, index_to_url).
+    Also populates crawl_website.titles and crawl_website.snippets.
+    """
+    graph, titles, snippets = asyncio.run(_crawl_async(entry_url, max_depth=max_depth))
+
+    all_urls: Set[str] = set(graph.keys())
+    for children in graph.values():
+        all_urls.update(children)
+
+    url_to_index = {url: idx for idx, url in enumerate(sorted(all_urls))}
+    index_to_url = {idx: url for url, idx in url_to_index.items()}
+
+    crawl_website.titles = titles
+    crawl_website.snippets = snippets
+    return graph, url_to_index, index_to_url
