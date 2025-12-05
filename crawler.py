@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import asyncio
 from collections import defaultdict, deque
-from typing import Dict, List, Optional, Set, Tuple
+from typing import Dict, Iterable, List, Optional, Set, Tuple
 from urllib.parse import urljoin, urlparse, urlunparse
 
 import aiohttp
@@ -160,7 +160,7 @@ async def _crawl_async(
                     if child not in seen:
                         queue.append((child, depth + 1))
 
-    return graph, titles, snippets
+    return graph, titles, snippets, seen, root_netloc
 
 
 def crawl_website(entry_url: str, max_depth: int = 2):
@@ -168,9 +168,12 @@ def crawl_website(entry_url: str, max_depth: int = 2):
     Crawl from a site's navigation links and build a link graph.
 
     Returns (graph, url_to_index, index_to_url).
-    Also populates crawl_website.titles and crawl_website.snippets.
+    Also populates crawl_website.titles, crawl_website.snippets, crawl_website.seen,
+    and crawl_website.root_netloc for later incremental expansion.
     """
-    graph, titles, snippets = asyncio.run(_crawl_async(entry_url, max_depth=max_depth))
+    graph, titles, snippets, seen, root_netloc = asyncio.run(
+        _crawl_async(entry_url, max_depth=max_depth)
+    )
 
     all_urls: Set[str] = set(graph.keys())
     for children in graph.values():
@@ -181,4 +184,71 @@ def crawl_website(entry_url: str, max_depth: int = 2):
 
     crawl_website.titles = titles
     crawl_website.snippets = snippets
+    crawl_website.seen = seen
+    crawl_website.root_netloc = root_netloc
     return graph, url_to_index, index_to_url
+
+
+# ----------------------- Incremental crawl ----------------------- #
+async def _crawl_subset(
+    seeds: Iterable[str],
+    seen: Set[str],
+    graph: Dict[str, List[str]],
+    titles: Dict[str, str],
+    snippets: Dict[str, str],
+    root_netloc: str,
+    max_pages: int,
+) -> int:
+    added = 0
+    queue: deque[Tuple[str, int]] = deque((s, 0) for s in seeds if s not in seen)
+    if not queue:
+        return 0
+
+    async with aiohttp.ClientSession(
+        timeout=REQUEST_TIMEOUT, headers={"User-Agent": USER_AGENT}
+    ) as session:
+        while queue and added < max_pages:
+            link, depth = queue.popleft()
+            if link in seen:
+                continue
+
+            seen.add(link)
+            html = await fetch_html(session, link)
+            if not html:
+                graph.setdefault(link, [])
+                continue
+
+            soup = BeautifulSoup(html, "html.parser")
+            titles[link] = _extract_title(soup)
+            text = soup.get_text(" ", strip=True)
+            snippets[link] = text[:300]
+
+            links = extract_links(soup, link, root_netloc)
+            graph[link] = sorted(links)
+            added += 1
+
+            if depth < 1:  # one hop deeper
+                for child in list(links)[:10]:
+                    if child not in seen:
+                        queue.append((child, depth + 1))
+    return added
+
+
+def expand_frontier(
+    entry_url: str,
+    seeds: Iterable[str],
+    graph: Dict[str, List[str]],
+    titles: Dict[str, str],
+    snippets: Dict[str, str],
+    seen: Set[str],
+    root_netloc: Optional[str] = None,
+    max_pages: int = 10,
+) -> int:
+    """
+    Incrementally crawl a small set of seeds (and one hop of their children).
+    Updates graph/titles/snippets/seen in place and returns number of pages added.
+    """
+    root = root_netloc or urlparse(entry_url).netloc
+    return asyncio.run(
+        _crawl_subset(seeds, seen, graph, titles, snippets, root, max_pages=max_pages)
+    )

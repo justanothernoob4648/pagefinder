@@ -1,10 +1,15 @@
 from __future__ import annotations
 
 from collections import defaultdict
+import os
 import re
 from typing import Dict, Iterable, List, Tuple
 
 import numpy as np
+try:
+    from openai import OpenAI
+except ImportError:  # Allow code to run without OpenAI installed
+    OpenAI = None
 
 
 # ----------------------- Matrix + PageRank ----------------------- #
@@ -152,3 +157,64 @@ def rank_pages(
         final_score = 0 * pr_score + 1 * semantic_score
         scores.append((url, final_score))
     return sorted(scores, key=lambda item: item[1], reverse=True)
+
+
+class LLMSemanticRanker:
+    """
+    Uses OpenAI embeddings to score how well each page matches a user goal.
+    Provide OPENAI_API_KEY in the environment before enabling this.
+    """
+
+    def __init__(self, model: str | None = None) -> None:
+        if OpenAI is None:
+            raise ImportError("openai package not installed. Add it to requirements and reinstall.")
+        api_key = os.getenv("OPENAI_API_KEY")
+        if not api_key:
+            raise ValueError("Missing OPENAI_API_KEY in environment.")
+
+        self.model = model or os.getenv("OPENAI_EMBEDDING_MODEL", "text-embedding-3-small")
+        # Set a short timeout so we fail fast if networking is blocked.
+        self.client = OpenAI(api_key=api_key, timeout=60)
+        self._cache: Dict[str, np.ndarray] = {}
+
+    def _embed(self, text: str) -> np.ndarray:
+        if not text:
+            return np.zeros(1)
+        if text in self._cache:
+            return self._cache[text]
+        resp = self.client.embeddings.create(model=self.model, input=text)
+        vec = np.array(resp.data[0].embedding, dtype=float)
+        self._cache[text] = vec
+        return vec
+
+    @staticmethod
+    def _cosine(a: np.ndarray, b: np.ndarray) -> float:
+        if a.size == 0 or b.size == 0:
+            return 0.0
+        denom = float(np.linalg.norm(a) * np.linalg.norm(b))
+        if denom == 0.0:
+            return 0.0
+        return float(np.dot(a, b) / denom)
+
+    def rank_pages(
+        self,
+        goal: str,
+        titles: Dict[str, str],
+        snippets: Dict[str, str],
+        pagerank: np.ndarray,
+        url_to_index: Dict[str, int],
+        pagerank_weight: float = 0.01,
+    ) -> List[Tuple[str, float]]:
+        pagerank_weight = max(0.0, min(1.0, pagerank_weight))
+        semantic_weight = 1.0 - pagerank_weight
+
+        goal_embed = self._embed(goal)
+        scores: List[Tuple[str, float]] = []
+        for url, idx in url_to_index.items():
+            pr_score = float(pagerank[idx]) if idx < len(pagerank) else 0.0
+            text = snippets.get(url) or titles.get(url, "")
+            page_embed = self._embed(text)
+            semantic_score = self._cosine(goal_embed, page_embed)
+            final_score = pagerank_weight * pr_score + semantic_weight * semantic_score
+            scores.append((url, final_score))
+        return sorted(scores, key=lambda item: item[1], reverse=True)
