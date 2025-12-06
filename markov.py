@@ -12,9 +12,8 @@ except ImportError:  # Allow code to run without OpenAI installed
     OpenAI = None
 
 
-# ----------------------- Matrix + PageRank ----------------------- #
+# Matrix + Pagerank
 def build_markov_matrix(graph: Dict[str, List[str]], url_to_index: Dict[str, int]) -> np.ndarray:
-    """Construct a column-stochastic Markov matrix from the crawl graph."""
     n = len(url_to_index)
     if n == 0:
         return np.zeros((0, 0))
@@ -44,8 +43,8 @@ def build_markov_matrix(graph: Dict[str, List[str]], url_to_index: Dict[str, int
     return M
 
 
-def compute_pagerank(M: np.ndarray, damping: float = 0.85, eps: float = 1e-6) -> np.ndarray:
-    """Iteratively compute PageRank until convergence."""
+def compute_pagerank(M: np.ndarray, damping: float = 0.9, eps: float = 1e-6) -> np.ndarray:
+
     n = M.shape[0]
     if n == 0:
         return np.array([])
@@ -62,7 +61,7 @@ def compute_pagerank(M: np.ndarray, damping: float = 0.85, eps: float = 1e-6) ->
     return rank
 
 
-# ----------------------- Semantic ranking ----------------------- #
+# Semantic Ranking
 
 STOPWORDS = {
     "the",
@@ -99,16 +98,13 @@ STOPWORDS = {
 
 
 def _tokenize(text: str) -> List[str]:
-    """Lowercase, keep alphanumerics, drop stopwords."""
+
     tokens = re.findall(r"[a-z0-9]+", text.lower())
     return [t for t in tokens if t and t not in STOPWORDS]
 
 
 def _text_to_embedding(text: str) -> Dict[str, float]:
-    """
-    Bag-of-words with unigram and bigram frequencies.
-    Bigrams help catch phrases like "tuition fee" or "financial aid".
-    """
+    
     tokens = _tokenize(text)
     if not tokens:
         return {}
@@ -147,7 +143,7 @@ def rank_pages(
     pagerank: np.ndarray,
     url_to_index: Dict[str, int],
 ) -> List[Tuple[str, float]]:
-    """Combine PageRank and chunk-level semantic similarity to produce final scores."""
+
     goal_embed = _text_to_embedding(goal)
     scores: List[Tuple[str, float]] = []
     for url, idx in url_to_index.items():
@@ -160,10 +156,6 @@ def rank_pages(
 
 
 class LLMSemanticRanker:
-    """
-    Uses OpenAI embeddings to score how well each page matches a user goal.
-    Provide OPENAI_API_KEY in the environment before enabling this.
-    """
 
     def __init__(self, model: str | None = None) -> None:
         if OpenAI is None:

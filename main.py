@@ -4,7 +4,13 @@ import argparse
 import os
 from typing import List, Optional
 
-from crawler import crawl_website, expand_frontier
+import numpy as np
+
+from crawler import (
+    crawl_with_whitelist,
+    discover_external_domains,
+    expand_frontier,
+)
 from markov import (
     LLMSemanticRanker,
     build_markov_matrix,
@@ -14,7 +20,6 @@ from markov import (
 
 
 def load_env_from_file(path: str = ".env") -> None:
-    """Lightweight .env loader to set env vars if they aren't already set."""
     if not os.path.isfile(path):
         return
     try:
@@ -34,35 +39,48 @@ def load_env_from_file(path: str = ".env") -> None:
         return
 
 #input: python main.py <url> --use-llm --hybrid-expand "help me log into my account"
+#python main.py https://www.cmu.edu/ --use-llm --pagerank-weight 0 --hybrid-expand --whitelist-top-k 5 --whitelist-depth 2 --crawl-depth 2
+#simple input (when using default flags): python main.py https://www.cmu.edu/ --use-llm "task"
 # or without the goal in order to enter multiple tasks in the same run
-# ----------------------- Main driver ----------------------- #
+# Main driver
 def main(
     entry_url: str,
     goals: Optional[List[str]] = None,
     use_llm: bool = False,
     llm_model: Optional[str] = None,
-    pagerank_weight: float = 0.2,
-    hybrid_expand: bool = False,
+    pagerank_weight: float = 0.0,
+    hybrid_expand: bool = True,
     hybrid_threshold: float = 0.3,  #when to trigger hybrid expansion
     hybrid_max_new: int = 5,        #how many new pages to fetch
     hybrid_frontier_k: int = 3,     #how many (top k promising) pages to use as the frontier for expansion
+    whitelist_depth: int = 2,       #depth to crawl in pass 1 (for whitelisting)
+    whitelist_top_k: int = 3,       #number of domains to whitelist
+    crawl_depth: int = 2,           #depth to crawl in pass 2 (for page parsing)
 ) -> None:
     # Load env vars (e.g., OPENAI_API_KEY) from .env if present.
     load_env_from_file()
 
-    graph, url_to_index, index_to_url = crawl_website(entry_url)
-    titles = getattr(crawl_website, "titles", {})
-    snippets = getattr(crawl_website, "snippets", {})
-    seen = getattr(crawl_website, "seen", set())
-    root_netloc = getattr(crawl_website, "root_netloc", None)
+    allowed_netlocs = discover_external_domains(
+        entry_url, max_depth=whitelist_depth, top_k=whitelist_top_k
+    )
+    print(f"[whitelist] Allowed domains: {sorted(allowed_netlocs)}")
+
+    graph, titles, snippets, seen = crawl_with_whitelist(
+        entry_url, allowed_netlocs, max_depth=crawl_depth
+    )
+
+    use_pagerank = pagerank_weight > 0.0
 
     def _recompute_rankings() -> tuple:
         all_urls = set(graph.keys())
         for children in graph.values():
             all_urls.update(children)
         new_url_to_index = {url: idx for idx, url in enumerate(sorted(all_urls))}
-        markov = build_markov_matrix(graph, new_url_to_index)
-        new_pagerank = compute_pagerank(markov)
+        if use_pagerank and new_url_to_index:
+            markov = build_markov_matrix(graph, new_url_to_index)
+            new_pagerank = compute_pagerank(markov)
+        else:
+            new_pagerank = np.zeros(len(new_url_to_index), dtype=float)
         return new_url_to_index, new_pagerank
 
     url_to_index, pagerank = _recompute_rankings()
@@ -104,7 +122,7 @@ def main(
             titles,
             snippets,
             seen,
-            root_netloc=root_netloc,
+            allowed_netlocs=allowed_netlocs,
             max_pages=hybrid_max_new,
         )
         if new_pages:
@@ -181,7 +199,7 @@ if __name__ == "__main__":
     parser.add_argument(
         "--pagerank-weight",
         type=float,
-        default=0.2,
+        default=0.0,
         help="Blend weight for PageRank when using LLM similarity (0-1).",
     )
     parser.add_argument(
@@ -207,6 +225,24 @@ if __name__ == "__main__":
         default=3,
         help="Use outbound links from top-k pages as the expansion frontier.",
     )
+    parser.add_argument(
+        "--whitelist-depth",
+        type=int,
+        default=2,
+        help="Pass1 depth for discovering external domains to whitelist.",
+    )
+    parser.add_argument(
+        "--whitelist-top-k",
+        type=int,
+        default=3,
+        help="How many external domains to whitelist from Pass1 PageRank.",
+    )
+    parser.add_argument(
+        "--crawl-depth",
+        type=int,
+        default=2,
+        help="Pass2 depth when crawling across allowed domains.",
+    )
     args = parser.parse_args()
 
     main(
@@ -219,4 +255,7 @@ if __name__ == "__main__":
         hybrid_threshold=args.hybrid_threshold,
         hybrid_max_new=args.hybrid_max_new,
         hybrid_frontier_k=args.hybrid_frontier_k,
+        whitelist_depth=args.whitelist_depth,
+        whitelist_top_k=args.whitelist_top_k,
+        crawl_depth=args.crawl_depth,
     )
