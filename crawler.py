@@ -460,13 +460,13 @@ async def _crawl_subset(
             graph[link] = sorted(links)
             added += 1
 
-            if depth < 1:  # one hop deeper
+            if depth < 5:  # how many hops to expand from each seed?
                 for child in list(links)[:10]:
                     if child not in seen:
                         queue.append((child, depth + 1))
     return added
 
-
+# when results are not satisfactory
 def expand_frontier(
     entry_url: str,
     seeds: Iterable[str],

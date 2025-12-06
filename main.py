@@ -114,7 +114,7 @@ def main(
             frontier.extend(graph.get(url, []))
         frontier = [u for u in frontier if u not in seen]
         if not frontier:
-            print("not frontier")
+            print("no frontier to expand from!")    #hmm wb depth?
             return False
 
         reason = "user request" if force else f"best_score={best_score:.4f} < {hybrid_threshold}"
@@ -233,7 +233,7 @@ if __name__ == "__main__":
     parser.add_argument(
         "--hybrid-max-new",
         type=int,
-        default=10,
+        default=50,
         help="Maximum new pages to crawl during a hybrid expansion.",
     )
     parser.add_argument(
