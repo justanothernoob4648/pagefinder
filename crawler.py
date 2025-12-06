@@ -206,7 +206,7 @@ def crawl_website(entry_url: str, max_depth: int = 2):
     return graph, url_to_index, index_to_url
 
 
-# Pass 1: discover external domains
+# PASS 1: discover external domains --------------
 async def _discover_domains_async(
     entry_url: str, max_depth: int
 ) -> Tuple[Dict[str, List[str]], Set[str], str]:
@@ -332,13 +332,28 @@ def discover_external_domains(entry_url: str, max_depth: int, top_k: int) -> Set
             print(f"  {url} -> {score:.6f}")
     #end trace
 
-    whitelist = {_normalize_netloc(url[len("domain://") :]) for url, _ in external_scores[:top_k]}
+    # Interactive whitelist
+    added = 0
+    ind = 0
+    whitelist: Set[str] = set()
+    while added<top_k and ind<len(external_scores):
+        url, _ = external_scores[ind]
+        normUrl = url[len("domain://") :]
+        resp = input(f"\nWould you like to include domain - {normUrl}? [Y/N]: ").strip().lower()
+        if resp in {"y", "yes"}:
+            added+=1
+            whitelist.add(_normalize_netloc(normUrl))
+        ind+=1
+
+    # # Automated whitelist
+    # whitelist = {_normalize_netloc(url[len("domain://") :]) for url, _ in external_scores[:top_k]}
+
     # Always include root domain
     whitelist.add(_normalize_netloc(root_netloc))
     return whitelist
 
 
-# Pass 2: crawl with whitelist
+# Pass 1: crawl with whitelist --------------
 async def _crawl_allowed_async(
     entry_url: str, allowed_netlocs: Set[str], max_depth: int
 ) -> Tuple[Dict[str, List[str]], Dict[str, str], Dict[str, str], Set[str]]:

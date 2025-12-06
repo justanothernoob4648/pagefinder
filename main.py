@@ -50,10 +50,10 @@ def main(
     llm_model: Optional[str] = None,
     pagerank_weight: float = 0.0,
     hybrid_expand: bool = True,
-    hybrid_threshold: float = 0.3,  #when to trigger hybrid expansion
+    hybrid_threshold: float = 0.5,  #when to trigger hybrid expansion
     hybrid_max_new: int = 5,        #how many new pages to fetch
     hybrid_frontier_k: int = 3,     #how many (top k promising) pages to use as the frontier for expansion
-    whitelist_depth: int = 2,       #depth to crawl in pass 1 (for whitelisting)
+    whitelist_depth: int = 1,       #depth to crawl in pass 1 (for whitelisting)
     whitelist_top_k: int = 3,       #number of domains to whitelist
     crawl_depth: int = 2,           #depth to crawl in pass 2 (for page parsing)
 ) -> None:
@@ -96,15 +96,17 @@ def main(
             print(f"LLM ranking unavailable: {exc}. Falling back to bag-of-words.")
 
     print(f"Crawled {len(url_to_index)} pages. Ready for ranking queries.")
+    interactive_mode = not bool(goals)
 
-    def _maybe_expand(goal: str, ranked: list[tuple[str, float]]) -> bool:
+    def _maybe_expand(goal: str, ranked: list[tuple[str, float]], *, force: bool = False) -> bool:
         nonlocal url_to_index, pagerank
-        if not (hybrid_expand and llm_ranker):
+        if not hybrid_expand:
             return False
         if not ranked:
             return False
+
         best_score = ranked[0][1]
-        if best_score >= hybrid_threshold:
+        if not force and best_score >= hybrid_threshold:
             return False
 
         frontier: List[str] = []
@@ -112,9 +114,11 @@ def main(
             frontier.extend(graph.get(url, []))
         frontier = [u for u in frontier if u not in seen]
         if not frontier:
+            print("not frontier")
             return False
 
-        print(f"[hybrid] Triggered (best_score={best_score:.4f} < {hybrid_threshold}); exploring frontier.")
+        reason = "user request" if force else f"best_score={best_score:.4f} < {hybrid_threshold}"
+        print(f"[hybrid] Triggered ({reason}); exploring frontier.")
         new_pages = expand_frontier(
             entry_url,
             frontier[:hybrid_max_new],
@@ -133,34 +137,45 @@ def main(
             return True
         return False
 
-    def _rank_and_print(goal: str) -> None:
+    def _rank(goal: str) -> list[tuple[str, float]]:
         if llm_ranker:
             try:
-                ranked = llm_ranker.rank_pages(
+                return llm_ranker.rank_pages(
                     goal, titles, snippets, pagerank, url_to_index, pagerank_weight
                 )
             except Exception as exc:
                 print(f"[llm] Ranking failed, falling back to bag-of-words: {exc}")
-                ranked = rank_pages(goal, titles, snippets, pagerank, url_to_index)
-        else:
-            ranked = rank_pages(goal, titles, snippets, pagerank, url_to_index)
+        return rank_pages(goal, titles, snippets, pagerank, url_to_index)
 
-        if _maybe_expand(goal, ranked):
-            if llm_ranker:
-                try:
-                    ranked = llm_ranker.rank_pages(
-                        goal, titles, snippets, pagerank, url_to_index, pagerank_weight
-                    )
-                except Exception as exc:
-                    print(f"[llm] Ranking failed after expand; fallback: {exc}")
-                    ranked = rank_pages(goal, titles, snippets, pagerank, url_to_index)
-
+    def _print_rankings(goal: str, ranked: list[tuple[str, float]]) -> None:
         print(f"\nGoal: {goal}")
         print("Top 10 pages:")
         for url, score in ranked[:10]:
             title = titles.get(url, "")
             snippet = snippets.get(url, "")
             print(f"- {url} | score={score:.4f} | title={title} | snippet='{snippet[:100]}'")
+
+    def _rank_and_print(goal: str) -> None:
+        ranked = _rank(goal)
+        _print_rankings(goal, ranked)
+
+        expanded = _maybe_expand(goal, ranked)
+        if expanded:
+            ranked = _rank(goal)
+            _print_rankings(goal, ranked)
+            
+        if interactive_mode:
+            while True:
+                answer = input("\nIs this what you are looking for? [Y/N]: ").strip().lower()
+                if answer in {"n", "no"}:
+                    expanded = _maybe_expand(goal, ranked, force=True)
+                    if expanded:
+                        ranked = _rank(goal)
+                        _print_rankings(goal, ranked)
+                else:
+                    break
+
+        
 
     if goals:
         for goal in goals:
@@ -189,6 +204,7 @@ if __name__ == "__main__":
     parser.add_argument(
         "--use-llm",
         action="store_true",
+        default=True,
         help="Use OpenAI embeddings to score semantic similarity.",
     )
     parser.add_argument(
@@ -205,18 +221,19 @@ if __name__ == "__main__":
     parser.add_argument(
         "--hybrid-expand",
         action="store_true",
+        default=True,
         help="If similarity is low, expand crawl from top candidates and retry ranking.",
     )
     parser.add_argument(
         "--hybrid-threshold",
         type=float,
-        default=0.3,
+        default=0.5,
         help="Trigger expansion if best score is below this value.",
     )
     parser.add_argument(
         "--hybrid-max-new",
         type=int,
-        default=5,
+        default=10,
         help="Maximum new pages to crawl during a hybrid expansion.",
     )
     parser.add_argument(
@@ -228,7 +245,7 @@ if __name__ == "__main__":
     parser.add_argument(
         "--whitelist-depth",
         type=int,
-        default=2,
+        default=1,
         help="Pass1 depth for discovering external domains to whitelist.",
     )
     parser.add_argument(
