@@ -105,6 +105,7 @@ python task_pages.py mit.edu "faculty directory" --whitelist-top-k 15
 ```
 related_domains.py   # Stage 1: Domain ranking via Personalized PageRank
 task_pages.py        # Stage 2: Task-relevant page search with embeddings
+ppr.py               # Personalized PageRank algorithm (imported by related_domains.py)
 requirements.txt     # Python dependencies
 .env                 # API keys (create this yourself)
 ```
